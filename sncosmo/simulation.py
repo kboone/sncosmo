@@ -1,6 +1,7 @@
 """Tools for simulation of transients."""
 
 import copy
+import abc
 from collections import OrderedDict
 
 import numpy as np
@@ -8,10 +9,19 @@ from astropy.cosmology import FlatLambdaCDM
 from astropy.table import Table
 from numpy import random
 from scipy.interpolate import InterpolatedUnivariateSpline as Spline1d
+import scipy.integrate as integrate
+import scipy.interpolate as interpolate
+from astropy.cosmology import Planck15
+from astropy import table
 
 from .utils import alias_map
+from .models import Model
 
-__all__ = ['zdist', 'realize_lcs']
+
+default_cosmology = Planck15
+
+# TODO: Figure out what should be in __all__
+# __all__ = ['zdist', 'realize_lcs']
 
 WHOLESKY_SQDEG = 4. * np.pi * (180. / np.pi) ** 2
 
@@ -127,7 +137,7 @@ def realize_lcs(observations, model, params, thresh=None,
     observations : `~astropy.table.Table` or `~numpy.ndarray`
         Table of observations. Must contain the following column names:
         ``band``, ``time``, ``zp``, ``zpsys``, ``gain``, ``skynoise``.
-    model : `sncosmo.Model`
+    model : `~sncosmo.Model`
         The model to use in the simulation.
     params : list (or generator) of dict
         List of parameters to feed to the model for realizing each light curve.
@@ -231,3 +241,301 @@ def realize_lcs(observations, model, params, thresh=None,
         lcs.append(Table(data, names=RESULT_COLNAMES, meta=p))
 
     return lcs
+
+def random_ra_dec(count=None):
+    if count == None:
+        use_count = 1
+    else:
+        use_count = count
+
+    p, q = np.random.random((2, use_count))
+
+    ra = 360. * p
+    dec = np.arcsin(2. * (q - 0.5)) * 180 / np.pi
+
+    if count == None:
+        return ra[0], dec[0]
+    else:
+        return ra, dec
+
+
+class Footprint(abc.ABC):
+    """Abstract base class to represent the footprint of a survey on the sky.
+    """
+    @abc.abstractmethod
+    def __init__(self):
+        """Instantiate the class"""
+
+    @abc.abstractmethod
+    def query(self, ra, dec, time):
+        """Query whether an object at a specific RA, Dec and time is in the footprint"""
+
+    @abc.abstractmethod
+    def sample(self, count=None):
+        """Sample a random ra, dec, and time from the footprint."""
+
+    @property
+    @abc.abstractmethod
+    def area(self):
+        """Return the area of the footprint in square degree years."""
+
+
+class FullSkyFootprint(Footprint):
+    def __init__(self, min_time, max_time):
+        self.min_time = min_time
+        self.max_time = max_time
+
+    def query(self, ra, dec, time):
+        return (time >= self.min_time) & (time < self.max_time)
+
+    def sample(self, count=None):
+        ra, dec = random_ra_dec(count)
+        time = np.random.uniform(self.min_time, self.max_time, count)
+
+        return ra, dec, time
+
+    @property
+    def area(self):
+        return 4 * 180**2 / np.pi * (self.max_time - self.min_time)
+
+
+class BoxFootprint(Footprint):
+    def __init__(self, min_ra, max_ra, min_dec, max_dec, min_time, max_time):
+        self.min_ra = min_ra
+        self.max_ra = max_ra
+        self.min_dec = min_dec
+        self.max_dec = max_dec
+        self.min_time = min_time
+        self.max_time = max_time
+
+    def query(self, ra, dec, time):
+        return (
+            (ra >= self.min_ra)
+            & (ra < self.max_ra)
+            & (dec >= self.min_dec)
+            & (dec < self.max_dec)
+            & (time >= self.min_time)
+            & (time < self.max_time)
+        )
+
+    def sample(self, count=None):
+        raise NotImplementedError("Sample not implemented for BoxFootprint! Aah!")
+
+    @property
+    def area(self):
+        raise NotImplementedError("area not implemented for BoxFootprint! Aah!")
+
+
+class CircularFootprint(Footprint):
+    """TODO: circular footprint around a specific point on the sky"""
+
+
+class SourceDistribution(abc.ABC):
+    """Class to represent the distribution of sources across the sky"""
+    def count(self, footprint):
+        pass
+
+    def simulate_catalog(self, count, start_time, end_time,
+                         flat_redshift=False):
+        """Simulate a source catalog
+
+        TODO: Figure out what should actually go in the base class.
+        """
+        pass
+
+
+class VolumetricSourceDistribution(SourceDistribution):
+    """Model sources that are evenly distributed across the sky.
+
+    Parameters
+    ----------
+    volumetric_rate : float or function
+        The volumetric rate in counts/yr/Mpc**3. This can be either a float
+        representing a constant rate as a function of redshift or a function
+        that takes the redshift as a parameter and returns the volumetric rate
+        at that redshift.
+    """
+    def __init__(self, volumetric_rate, min_redshift=0., max_redshift=3.,
+                 cosmology=default_cosmology):
+        self.volumetric_rate = volumetric_rate
+        self.cosmology = cosmology
+
+        self._update_redshift_distribution(min_redshift, max_redshift)
+
+    def _update_redshift_distribution(self, min_redshift, max_redshift,
+                                      redshift_bins=10000):
+        """Set up the distribution to operate over a given redshift range.
+
+        This also creates and inverse CDF sampler to draw redshifts from.
+        """
+        self.min_redshift = min_redshift
+        self.max_redshift = max_redshift
+
+        sample_redshift_range = np.linspace(
+            min_redshift, max_redshift, redshift_bins
+        )
+        normalized_rates = self.rate(sample_redshift_range)
+        normalized_rates /= np.sum(normalized_rates)
+        cum_rates = np.cumsum(normalized_rates)
+
+        self.redshift_cdf = interpolate.interp1d(
+            cum_rates,
+            sample_redshift_range
+        )
+
+    def rate(self, redshift):
+        """Calculate the total rate of this source at a given redshift.
+
+        Parameters
+        ----------
+        redshift : float
+            The redshift to estimate the rate at.
+
+        Returns
+        -------
+        rate : float
+            The rate of this source at the given redshift in counts/yr/unit
+            redshift
+        """
+        if callable(self.volumetric_rate):
+            rate = self.volumetric_rate(redshift)
+        else:
+            rate = self.volumetric_rate
+
+        rate = (
+            4. * np.pi
+            * rate
+            * self.cosmology.differential_comoving_volume(redshift).value 
+        )
+
+        return rate
+
+    def count(self, time):
+        """Count how many transients we would expect to see in a given time.
+
+        Parameters
+        ----------
+        time : float
+            The time in years.
+        """
+        return time * integrate.quad(self.rate, self.min_redshift,
+                                     self.max_redshift)[0]
+
+    def simulate_catalog(self, count, start_time, end_time,
+                         flat_redshift=False):
+        """Simulate a source catalog"""
+        ref_count = self.count((end_time - start_time) * 365.2425)
+
+        if flat_redshift:
+            # Sample from a flat redshift distribution
+            redshifts = np.random.uniform(self.min_redshift, self.max_redshift,
+                                          count)
+            weights = self.rate(redshifts) / count
+        else:
+            # Sample from the True redshift distribution
+            redshifts = self.redshift_cdf(np.random.random(size=count))
+            weights = np.ones(len(redshifts))
+
+        ras, decs = random_ra_dec(count)
+
+        t0 = np.random.uniform(start_time, end_time, count)
+
+        result = table.Table({
+            'z': redshifts,
+            't0': t0,
+            'ra': ras,
+            'dec': decs,
+            'weight': weights,
+            'parameters': [{}] * count
+        })
+
+        return result
+
+
+class SALT2Distribution(VolumetricSourceDistribution):
+    """Model the distribution of Type Ia supernovae across the sky using the
+    SALT2 model.
+    """
+    def simulate_catalog(self, count, start_time, end_time, *args, **kwargs):
+        result = super().simulate_catalog(count, start_time, end_time, *args,
+                                          **kwargs)
+
+        result['source'] = 'salt2-extended'
+
+        x1 = np.random.normal(0, 1, count)
+        c = np.random.exponential(0.1, count)
+
+        result['peakabsmag'] = -19.1 - 0.13 * x1 + 3.1 * c
+        result['peakmagband'] = 'bessellb'
+        result['peakmagsys'] = 'ab'
+
+        result['parameters'] = _generate_parameter_dicts(
+            z=result['z'], t0=result['t0'], x1=x1, c=c,
+        )
+
+        return result
+
+
+class CoreCollapseDistribution(VolumetricSourceDistribution):
+    """Model the distribution of Type Ia supernovae across the sky using the
+    SALT2 model.
+    """
+    def __init__(self, volumetric_rate=lambda z: 5.0e-5*(1+z)**2., **kwargs):
+        super().__init__(volumetric_rate=volumetric_rate, **kwargs)
+
+    def simulate_catalog(self, count, start_time, end_time, *args, **kwargs):
+        result = super().simulate_catalog(count, start_time, end_time, *args,
+                                          **kwargs)
+
+        result['source'] = 'nugent-sn1bc'
+        result['parameters'] = _generate_parameter_dicts(
+            z=result['z'], t0=result['t0']
+        )
+
+        result['peakabsmag'] = -18. + np.random.normal(0, 1, count)
+        result['peakmagband'] = 'bessellb'
+        result['peakmagsys'] = 'ab'
+
+        return result
+
+def _generate_parameter_dicts(**kwargs):
+    """Generate individual parameter dicts for a large number of sources
+
+    Parameters
+    ----------
+    kwargs
+        For each key, a list of the values for that key.
+    """
+    parameter_dicts = []
+    keys = kwargs.keys()
+    for row_values in zip(*kwargs.values()):
+        parameter_dicts.append(dict(zip(keys, row_values)))
+
+    return parameter_dicts
+
+def cc_volumetric_rate(z):
+    z = np.atleast_1d(z)
+
+    result = np.zeros(shape=np.shape(z))
+
+    low_z_mask = z < 0.8
+
+    result[low_z_mask] = (5.0e-5*(1+z[low_z_mask])**4.5)
+    result[~low_z_mask] = 5.44e-4
+
+    if np.ndim(z) == 0:
+        return result[0]
+    else:
+        return result
+
+
+def generate_model(meta):
+    model = Model(source=meta['source'])
+
+    for param in meta['parameters']:
+        model[param] = meta[param]
+
+    model.set_source_peakabsmag(meta['peakabsmag'], meta['peakmagband'],
+                                meta['peakmagsys'])
+
+    return model
