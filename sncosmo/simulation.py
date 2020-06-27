@@ -332,11 +332,86 @@ class SourceDistribution(abc.ABC):
         """
 
     @abc.abstractmethod
-    def simulate(self, count, start_time, end_time):
+    def simulate(self, field, count, start_time, end_time):
         """Simulate a source catalog
 
         TODO: Figure out what should actually go in the base class.
         """
+
+    def __add__(self, other):
+        return CombinedSourceDistribution(self, other)
+
+
+class CombinedSourceDistribution(SourceDistribution):
+    """Class to represent the combination of multiple different kinds of sources
+
+    Parameters
+    ----------
+    *source_distributions : `~sncosmo.SourceDistribution` objects
+        The source distributions to combine.
+    """
+    def __init__(self, *source_distributions):
+        use_source_distributions = []
+        for source_distribution in source_distributions:
+            # Make sure that we were actually given SourceDistribution objects.
+            if not isinstance(source_distribution, SourceDistribution):
+                raise ValueError("can only combine source distributions.")
+
+            # Unpack any other CombinedSourceDistribution objects.
+            if isinstance(source_distribution, CombinedSourceDistribution):
+                use_source_distributions.extend(
+                    source_distribution._source_distributions)
+            else:
+                use_source_distributions.append(source_distribution)
+
+        self._source_distributions = use_source_distributions
+
+    def field_rate(self, field):
+        """Calculate how many transients will be seen in a given field per year.
+
+        This counts all of the different kinds of sources.
+
+        Parameters
+        ----------
+        field : `~sncosmo.Field`
+            The field that is being observed.
+        """
+        total_rate = 0
+        for source_distribution in self._source_distributions:
+            total_rate += source_distribution.field_rate(field)
+
+        return total_rate
+
+    def simulate(self, field, count, start_time, end_time):
+        """Simulate a source catalog
+
+        This samples from all of the different sub-distributions in proportion to their
+        rates.
+        """
+        # Figure out the probability of each source type
+        rates = np.array([i.field_rate(field) for i in self._source_distributions])
+        norm_rates = rates / np.sum(rates)
+
+        # Randomly choose how many of each model to use.
+        models = np.random.choice(np.arange(len(self._source_distributions)), count,
+                                  p=norm_rates)
+
+        # Simulate the desired number of each model.
+        full_catalog = []
+        for source_id, source_distribution in enumerate(self._source_distributions):
+            source_count = np.sum(models == source_id)
+            source_catalog = source_distribution.simulate(field, source_count,
+                                                          start_time, end_time)
+            full_catalog.append(source_catalog)
+
+        full_catalog = table.vstack(full_catalog)
+
+        # Randomly shuffle the catalog.
+        order = np.arange(count)
+        np.random.shuffle(order)
+        full_catalog = full_catalog[order]
+
+        return full_catalog
 
 
 class VolumetricSourceDistribution(SourceDistribution):
@@ -433,7 +508,7 @@ class VolumetricSourceDistribution(SourceDistribution):
 
         return solid_angle / WHOLESKY_SQDEG * all_sky_rate
 
-    def simulate(self, field, start_time, end_time, count, flat_redshift=False):
+    def simulate(self, field, count, start_time, end_time, flat_redshift=False):
         """Simulate a catalog"""
         ref_count = self.field_rate(field) * (end_time - start_time) * 365.25
 
@@ -554,6 +629,9 @@ class TemplateVolumetricDistribution(VolumetricSourceDistribution):
     We assume that the template only has three parameters: z, t0 and a parameter that
     represents the amplitude of the template. This is the case for any of the
     `~sncosmo.TimeSeriesSource` templates.
+
+    Additionally, we assume that the absolute magnitude of the template should be drawn
+    from a Gaussian distribution.
     """
     def __init__(self, source, volumetric_rate, ref_absmag, ref_absmag_dispersion, 
                  ref_band='bessellb', ref_magsys='ab', *args, **kwargs):
