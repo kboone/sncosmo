@@ -244,7 +244,11 @@ def realize_lcs(observations, model, params, thresh=None,
 
     return lcs
 
-def random_ra_dec(count=None):
+def random_ra_dec(count=None, min_ra=0., max_ra=360., min_dec=-90., max_dec=90.):
+    """Return a random RA and Dec with the given bounds
+
+    By default, this uses the full sky.
+    """
     if count == None:
         use_count = 1
     else:
@@ -252,19 +256,25 @@ def random_ra_dec(count=None):
 
     p, q = np.random.random((2, use_count))
 
-    ra = 360. * p
-    dec = np.arcsin(2. * (q - 0.5)) * 180 / np.pi
+    sin_min_dec = np.sin(min_dec * np.pi / 180.)
+    sin_max_dec = np.sin(max_dec * np.pi / 180.)
+
+    ra = min_ra + p * (max_ra - min_ra)
+    dec = np.arcsin((sin_max_dec - sin_min_dec) * q + sin_min_dec) * 180 / np.pi
 
     if count == None:
         return ra[0], dec[0]
     else:
         return ra, dec
 
-
 class Field(abc.ABC):
-    """Abstract base class to represent a field on the sky."""
+    """Abstract base class to represent a field on the sky.
+
+    A field captures the area on the sky that should be simulated along with the time
+    period that the simulation should cover.
+    """
     @abc.abstractmethod
-    def query(self, ra, dec):
+    def query(self, ra, dec, time):
         """Query whether an object at a specific ra and dec is in the field"""
 
     @abc.abstractmethod
@@ -276,43 +286,72 @@ class Field(abc.ABC):
     def solid_angle(self):
         """Return the solid angle of the field in square degrees"""
 
+    @property
+    @abc.abstractmethod
+    def solid_angle_time(self):
+        """Return the solid angle-time of the field in square degree years"""
+    
+
 
 class FullSkyField(Field):
-    def query(self, ra, dec):
-        if np.isscalar(ra):
-            return True
-        else:
-            return np.ones_like(ra, dtype=bool)
+    def __init__(self, min_time, max_time):
+        self.min_time = min_time
+        self.max_time = max_time
+
+    def query(self, ra, dec, time):
+        return (time >= self.min_time) & (time < self.max_time)
 
     def sample(self, count=None):
-        return random_ra_dec(count)
+        ra, dec = random_ra_dec(count)
+        time = np.random.uniform(self.min_time, self.max_time, count)
+        return ra, dec, time
 
     @property
     def solid_angle(self):
         return WHOLESKY_SQDEG
 
+    @property
+    def solid_angle_time(self):
+        return self.solid_angle * (self.max_time - self.min_time) / 365.25
+
 
 class BoxField(Field):
-    def __init__(self, min_ra, max_ra, min_dec, max_dec):
+    def __init__(self, min_time, max_time, min_ra, max_ra, min_dec, max_dec):
         self.min_ra = min_ra
         self.max_ra = max_ra
         self.min_dec = min_dec
         self.max_dec = max_dec
+        self.min_time = min_time
+        self.max_time = max_time
 
-    def query(self, ra, dec):
+    def query(self, ra, dec, time):
         return (
             (ra >= self.min_ra)
             & (ra < self.max_ra)
             & (dec >= self.min_dec)
             & (dec < self.max_dec)
+            & (time >= self.min_time)
+            & (time < self.max_time)
         )
 
     def sample(self, count=None):
-        raise NotImplementedError("Sample not implemented for BoxField! Aah!")
+        ra, dec = random_ra_dec(count, self.min_ra, self.max_ra, self.min_dec,
+                                self.max_dec)
+        time = np.random.uniform(self.min_time, self.max_time, count)
+        return ra, dec, time
 
     @property
     def solid_angle(self):
-        raise NotImplementedError("coverage not implemented for BoxField! Aah!")
+        return (
+            (self.max_ra - self.min_ra)
+            * (np.sin(self.max_dec * np.pi / 180.)
+               - np.sin(self.min_dec * np.pi / 180.))
+            * (180. / np.pi)
+        )
+
+    @property
+    def solid_angle_time(self):
+        return self.solid_angle * (self.max_time - self.min_time) / 365.25
 
 
 class CircularField(Field):
@@ -322,8 +361,8 @@ class CircularField(Field):
 class SourceDistribution(abc.ABC):
     """Class to represent the distribution of sources across the sky"""
     @abc.abstractmethod
-    def field_rate(self, field):
-        """Calculate how many transients will be seen in a given field per year.
+    def field_count(self, field):
+        """Calculate how many transients will be seen in a given field.
 
         Parameters
         ----------
@@ -332,7 +371,7 @@ class SourceDistribution(abc.ABC):
         """
 
     @abc.abstractmethod
-    def simulate(self, field, count, start_time, end_time):
+    def simulate(self, field, count):
         """Simulate a source catalog
 
         TODO: Figure out what should actually go in the base class.
@@ -366,8 +405,8 @@ class CombinedSourceDistribution(SourceDistribution):
 
         self._source_distributions = use_source_distributions
 
-    def field_rate(self, field):
-        """Calculate how many transients will be seen in a given field per year.
+    def field_count(self, field):
+        """Calculate how many transients will be seen in a given field.
 
         This counts all of the different kinds of sources.
 
@@ -376,32 +415,31 @@ class CombinedSourceDistribution(SourceDistribution):
         field : `~sncosmo.Field`
             The field that is being observed.
         """
-        total_rate = 0
+        total_count = 0
         for source_distribution in self._source_distributions:
-            total_rate += source_distribution.field_rate(field)
+            total_count += source_distribution.field_count(field)
 
-        return total_rate
+        return total_count
 
-    def simulate(self, field, count, start_time, end_time):
+    def simulate(self, field, count):
         """Simulate a source catalog
 
         This samples from all of the different sub-distributions in proportion to their
         rates.
         """
         # Figure out the probability of each source type
-        rates = np.array([i.field_rate(field) for i in self._source_distributions])
-        norm_rates = rates / np.sum(rates)
+        counts = np.array([i.field_count(field) for i in self._source_distributions])
+        norm_counts = counts / np.sum(counts)
 
         # Randomly choose how many of each model to use.
         models = np.random.choice(np.arange(len(self._source_distributions)), count,
-                                  p=norm_rates)
+                                  p=norm_counts)
 
         # Simulate the desired number of each model.
         full_catalog = []
         for source_id, source_distribution in enumerate(self._source_distributions):
             source_count = np.sum(models == source_id)
-            source_catalog = source_distribution.simulate(field, source_count,
-                                                          start_time, end_time)
+            source_catalog = source_distribution.simulate(field, source_count)
             full_catalog.append(source_catalog)
 
         full_catalog = table.vstack(full_catalog)
@@ -494,23 +532,23 @@ class VolumetricSourceDistribution(SourceDistribution):
 
         return rate
 
-    def field_rate(self, field):
-        """Calculate how many transients will be seen in a given field per year.
+    def field_count(self, field):
+        """Calculate how many transients will be seen in a given field.
 
         Parameters
         ----------
         field : `~sncosmo.Field`
             The field that is being observed.
         """
-        solid_angle = field.solid_angle
-        all_sky_rate = integrate.quad(self.all_sky_rate, self.min_redshift,
-                                      self.max_redshift)[0]
+        solid_angle_time = field.solid_angle_time
+        all_sky_count = integrate.quad(self.all_sky_rate, self.min_redshift,
+                                       self.max_redshift)[0]
 
-        return solid_angle / WHOLESKY_SQDEG * all_sky_rate
+        return solid_angle_time / WHOLESKY_SQDEG * all_sky_count
 
-    def simulate(self, field, count, start_time, end_time, flat_redshift=False):
+    def simulate(self, field, count, flat_redshift=False):
         """Simulate a catalog"""
-        ref_count = self.field_rate(field) * (end_time - start_time) * 365.25
+        ref_count = self.field_count(field)
 
         # TODO: Weighting by redshift or things like that
         # if flat_redshift:
@@ -524,12 +562,11 @@ class VolumetricSourceDistribution(SourceDistribution):
         redshifts = self.redshift_cdf(np.random.random(size=count))
         weights = np.ones(len(redshifts))
 
-        ras, decs = field.sample(count)
-        t0 = np.random.uniform(start_time, end_time, count)
+        ras, decs, times = field.sample(count)
 
         result = table.Table({
             'z': redshifts,
-            't0': t0,
+            't0': times,
             'ra': ras,
             'dec': decs,
             'weight': weights,
