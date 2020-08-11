@@ -650,6 +650,7 @@ class TemplateVolumetricDistribution(VolumetricSourceDistribution):
         mag_amplitude = (
             self.ref_absmag
             + np.random.normal(0, self.ref_absmag_dispersion, count)
+            + self.cosmo.distmod(locations['z']).value
             + amplitude_zp
         )
         amplitude = 10**(-0.4 * mag_amplitude)
