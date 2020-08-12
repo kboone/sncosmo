@@ -25,7 +25,7 @@ default_cosmo = WMAP9
 # TODO: Figure out what should be in __all__
 # __all__ = ['zdist', 'realize_lcs']
 
-WHOLESKY_SQDEG = 4. * np.pi * (180. / np.pi) ** 2
+WHOLESKY_SQDEG = 4. * np.pi * (180. / np.pi)**2
 
 
 def zdist(zmin, zmax, time=365.25, area=1.,
@@ -256,16 +256,33 @@ def random_ra_dec(count=None, min_ra=0., max_ra=360., min_dec=-90., max_dec=90.)
 
     p, q = np.random.random((2, use_count))
 
-    sin_min_dec = np.sin(min_dec * np.pi / 180.)
-    sin_max_dec = np.sin(max_dec * np.pi / 180.)
+    sin_min_dec = np.sin(np.radians(min_dec))
+    sin_max_dec = np.sin(np.radians(max_dec))
 
     ra = min_ra + p * (max_ra - min_ra)
-    dec = np.arcsin((sin_max_dec - sin_min_dec) * q + sin_min_dec) * 180 / np.pi
+    dec = np.degrees(np.arcsin((sin_max_dec - sin_min_dec) * q + sin_min_dec))
 
     if count == None:
         return ra[0], dec[0]
     else:
         return ra, dec
+
+
+def coordinate_angle(ra1, dec1, ra2, dec2):
+    """Compute the angle between two coordinates
+
+    We use the Haversine formula
+    """
+    ra1_rad = np.radians(ra1)
+    ra2_rad = np.radians(ra2)
+    dec1_rad = np.radians(dec1)
+    dec2_rad = np.radians(dec2)
+
+    return np.degrees(2 * np.arcsin(np.sqrt(
+        np.sin((dec2_rad - dec1_rad) / 2.)**2
+        + np.cos(dec1_rad) * np.cos(dec2_rad) * np.sin((ra2_rad - ra1_rad) / 2.)**2
+    )))
+
 
 class Field(abc.ABC):
     """Abstract base class to represent a field on the sky.
@@ -318,7 +335,8 @@ class FullSkyField(Field):
 
 
 class BoxField(Field):
-    def __init__(self, min_time, max_time, min_ra, max_ra, min_dec, max_dec):
+    """Box-like field on the sky with limits in both RA and Dec"""
+    def __init__(self, min_ra, max_ra, min_dec, max_dec, min_time, max_time):
         self.min_ra = min_ra
         self.max_ra = max_ra
         self.min_dec = min_dec
@@ -346,9 +364,8 @@ class BoxField(Field):
     def solid_angle(self):
         return (
             (self.max_ra - self.min_ra)
-            * (np.sin(self.max_dec * np.pi / 180.)
-               - np.sin(self.min_dec * np.pi / 180.))
-            * (180. / np.pi)
+            * np.degrees(np.sin(np.radians(self.max_dec)) -
+                         np.sin(np.radians(self.min_dec)))
         )
 
     @property
@@ -357,7 +374,71 @@ class BoxField(Field):
 
 
 class CircularField(Field):
-    """TODO: circular field around a specific point on the sky"""
+    """Circular field around a specific point on the sky"""
+    def __init__(self, ra, dec, angle, min_time, max_time):
+        self.min_time = min_time
+        self.max_time = max_time
+        self.ra = ra
+        self.dec = dec
+        self.angle = angle
+
+    def query(self, ra, dec, time):
+        angle = coordinate_angle(self.ra, self.dec, ra, dec)
+        return (
+            (angle <= self.angle)
+            & (time >= self.min_time)
+            & (time < self.max_time)
+        )
+
+    def sample(self, count=None):
+        if count is None:
+            single = True
+            count = 1
+        else:
+            single = False
+
+        # Convert to Cartesian coordinates
+        ra_rad = np.radians(self.ra)
+        dec_rad = np.radians(self.dec)
+        x = np.cos(dec_rad) * np.cos(ra_rad)
+        y = np.cos(dec_rad) * np.sin(ra_rad)
+        z = np.sin(dec_rad)
+        ref_coord = np.array([x, y, z])
+
+        # Generate orthogonal vectors using the Gram-Schmidt process
+        rand_coord = np.random.normal(size=(count, 3))
+        rand_ortho = rand_coord - rand_coord.dot(ref_coord)[:, None] * ref_coord
+        rand_norm = rand_ortho / np.linalg.norm(rand_ortho, axis=1)[:, None]
+
+        # Draw a random offset angle
+        c = np.random.uniform(size=count)
+        sample_angle = np.arccos(1 - c * (1 - np.cos(np.radians(self.angle))))
+
+        # Apply random rotations using the Rodrigues' rotation formula
+        sample_coord = (
+            ref_coord * np.cos(sample_angle[:, None])
+            + np.cross(ref_coord, rand_norm) * np.sin(sample_angle[:, None])
+        )
+
+        # Convert the sampled coordinates to RA and Dec
+        sample_ra = (
+            np.degrees(np.arctan2(sample_coord[:, 1], sample_coord[:, 0]))
+            % 360.
+        )
+        sample_dec = 90. - np.degrees(np.arccos(sample_coord[:, 2]))
+
+        if single:
+            return sample_ra[0], sample_dec[0]
+        else:
+            return sample_ra, sample_dec
+
+    @property
+    def solid_angle(self):
+        return 2 * np.pi * (1 - np.cos(np.radians(self.angle))) * (180. / np.pi)**2
+
+    @property
+    def solid_angle_time(self):
+        return self.solid_angle * (self.max_time - self.min_time) / 365.25
 
 
 class CombinedField(Field):
