@@ -371,7 +371,7 @@ class SourceDistribution(abc.ABC):
         """
 
     @abc.abstractmethod
-    def simulate(self, field, count):
+    def simulate(self, field, count, reference_count=None, **kwargs):
         """Simulate a source catalog
 
         TODO: Figure out what should actually go in the base class.
@@ -421,7 +421,7 @@ class CombinedSourceDistribution(SourceDistribution):
 
         return total_count
 
-    def simulate(self, field, count):
+    def simulate(self, field, count, reference_count=None, **kwargs):
         """Simulate a source catalog
 
         This samples from all of the different sub-distributions in proportion to their
@@ -546,21 +546,22 @@ class VolumetricSourceDistribution(SourceDistribution):
 
         return solid_angle_time / WHOLESKY_SQDEG * all_sky_count
 
-    def simulate(self, field, count, flat_redshift=False):
+    def simulate(self, field, count, reference_count=None, flat_redshift=False,
+                 **kwargs):
         """Simulate a catalog"""
-        ref_count = self.field_count(field)
+        if reference_count is None:
+            reference_count = self.field_count(field)
 
-        # TODO: Weighting by redshift or things like that
-        # if flat_redshift:
+        if flat_redshift:
             # Sample from a flat redshift distribution
-            # redshifts = np.random.uniform(self.min_redshift, self.max_redshift,
-                                          # count)
-            # weights = self.all_sky_rate(redshifts) / count
-        # else:
+            redshifts = np.random.uniform(self.min_redshift, self.max_redshift, count)
+            raw_weights = self.all_sky_rate(redshifts)
+        else:
             # Sample from the True redshift distribution
+            redshifts = self.redshift_cdf(np.random.random(size=count))
+            raw_weights = np.ones(len(redshifts))
 
-        redshifts = self.redshift_cdf(np.random.random(size=count))
-        weights = np.ones(len(redshifts))
+        weights = raw_weights / np.sum(raw_weights) * reference_count
 
         ras, decs, times = field.sample(count)
 
