@@ -279,7 +279,7 @@ class Field(abc.ABC):
 
     @abc.abstractmethod
     def sample(self, count=None):
-        """Sample a random ra and dec from the field."""
+        """Sample a random ra and dec and time from the field."""
 
     @property
     @abc.abstractmethod
@@ -290,7 +290,9 @@ class Field(abc.ABC):
     @abc.abstractmethod
     def solid_angle_time(self):
         """Return the solid angle-time of the field in square degree years"""
-    
+
+    def __add__(self, other):
+        return CombinedField(self, other)
 
 
 class FullSkyField(Field):
@@ -358,6 +360,98 @@ class CircularField(Field):
     """TODO: circular field around a specific point on the sky"""
 
 
+class CombinedField(Field):
+    """Class to represent the combination of multiple fields
+
+    Parameters
+    *fields : `~sncosmo.Field` objects
+        The fields to combine
+    """
+    def __init__(self, *fields):
+        use_fields = []
+        for field in fields:
+            # Make sure that we were actually given Field objects
+            if not isinstance(field, Field):
+                raise ValueError("can only combine fields.")
+
+            # Unpack any other Field objects.
+            if isinstance(field, CombinedField):
+                use_fields.extend(field._fields)
+            else:
+                use_fields.append(field)
+
+        self._fields = use_fields
+
+    def query(self, ra, dec, time):
+        # Check each of the subfields individually.
+        result = False
+        for field in self._fields:
+            result &= field.query(ra, dec, time)
+        return result
+
+    def sample(self, count=None):
+        """Sample a random ra and dec and time from one of the subfields.
+
+        Each subfield is weighted based off of the solid_angle_time. This is correct for
+        transients, but if non-transient sources (e.g. variable stars) are ever
+        implemented, they should weight by solid_angle instead.
+        """
+        if count is None:
+            single = True
+            count = 1
+        else:
+            single = False
+
+        # Figure out the probability of each source type
+        weights = np.array([i.solid_angle_time for i in self._fields])
+        norm_weights = weights / np.sum(weights)
+
+        # Randomly choose how many of each field to use.
+        fields = np.random.choice(np.arange(len(self._fields)), count, p=norm_weights)
+
+        # Simulate the desired number of each field.
+        ra = []
+        dec = []
+        time = []
+        for field_id, field in enumerate(self._fields):
+            field_count = np.sum(fields == field_id)
+            if field_count > 0:
+                field_ra, field_dec, field_time = field.sample(field_count)
+                ra.append(field_ra)
+                dec.append(field_dec)
+                time.append(field_time)
+
+        ra = np.hstack(ra)
+        dec = np.hstack(dec)
+        time = np.hstack(time)
+
+        # Randomly shuffle the positions.
+        order = np.arange(count)
+        np.random.shuffle(order)
+        ra = ra[order]
+        dec = dec[order]
+        time = time[order]
+
+        if single:
+            return ra[0], dec[0], time[0]
+        else:
+            return ra, dec, time
+
+    @property
+    def solid_angle(self):
+        solid_angle = 0
+        for field in self._fields:
+            solid_angle += field.solid_angle
+        return solid_angle
+
+    @property
+    def solid_angle_time(self):
+        solid_angle_time = 0
+        for field in self._fields:
+            solid_angle_time += field.solid_angle_time
+        return solid_angle_time
+
+
 class SourceDistribution(abc.ABC):
     """Class to represent the distribution of sources across the sky"""
     @abc.abstractmethod
@@ -390,7 +484,7 @@ class CombinedSourceDistribution(SourceDistribution):
         The source distributions to combine.
     """
     def __init__(self, *source_distributions):
-        distributions = []
+        use_distributions = []
         for source_distribution in source_distributions:
             # Make sure that we were actually given SourceDistribution objects.
             if not isinstance(source_distribution, SourceDistribution):
@@ -398,11 +492,11 @@ class CombinedSourceDistribution(SourceDistribution):
 
             # Unpack any other CombinedSourceDistribution objects.
             if isinstance(source_distribution, CombinedSourceDistribution):
-                distributions.extend(source_distribution._source_distributions)
+                use_distributions.extend(source_distribution._source_distributions)
             else:
-                distributions.append(source_distribution)
+                use_distributions.append(source_distribution)
 
-        self._source_distributions = distributions
+        self._source_distributions = use_distributions
 
     def field_count(self, field):
         """Calculate how many transients will be seen in a given field.
