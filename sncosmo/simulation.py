@@ -390,7 +390,7 @@ class CombinedSourceDistribution(SourceDistribution):
         The source distributions to combine.
     """
     def __init__(self, *source_distributions):
-        use_source_distributions = []
+        distributions = []
         for source_distribution in source_distributions:
             # Make sure that we were actually given SourceDistribution objects.
             if not isinstance(source_distribution, SourceDistribution):
@@ -398,12 +398,11 @@ class CombinedSourceDistribution(SourceDistribution):
 
             # Unpack any other CombinedSourceDistribution objects.
             if isinstance(source_distribution, CombinedSourceDistribution):
-                use_source_distributions.extend(
-                    source_distribution._source_distributions)
+                distributions.extend(source_distribution._source_distributions)
             else:
-                use_source_distributions.append(source_distribution)
+                distributions.append(source_distribution)
 
-        self._source_distributions = use_source_distributions
+        self._source_distributions = distributions
 
     def field_count(self, field):
         """Calculate how many transients will be seen in a given field.
@@ -431,6 +430,9 @@ class CombinedSourceDistribution(SourceDistribution):
         counts = np.array([i.field_count(field) for i in self._source_distributions])
         norm_counts = counts / np.sum(counts)
 
+        if reference_count is None:
+            reference_count = np.sum(counts)
+
         # Randomly choose how many of each model to use.
         models = np.random.choice(np.arange(len(self._source_distributions)), count,
                                   p=norm_counts)
@@ -439,7 +441,13 @@ class CombinedSourceDistribution(SourceDistribution):
         full_catalog = []
         for source_id, source_distribution in enumerate(self._source_distributions):
             source_count = np.sum(models == source_id)
-            source_catalog = source_distribution.simulate(field, source_count)
+            source_reference_count = source_count / count * reference_count
+            source_catalog = source_distribution.simulate(
+                field,
+                source_count,
+                source_reference_count,
+                **kwargs
+            )
             full_catalog.append(source_catalog)
 
         full_catalog = table.vstack(full_catalog)
