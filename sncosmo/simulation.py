@@ -427,10 +427,12 @@ class CircularField(Field):
         )
         sample_dec = 90. - np.degrees(np.arccos(sample_coord[:, 2]))
 
+        time = np.random.uniform(self.min_time, self.max_time, count)
+
         if single:
-            return sample_ra[0], sample_dec[0]
+            return sample_ra[0], sample_dec[0], time[0]
         else:
-            return sample_ra, sample_dec
+            return sample_ra, sample_dec, time
 
     @property
     def solid_angle(self):
@@ -443,6 +445,12 @@ class CircularField(Field):
 
 class CombinedField(Field):
     """Class to represent the combination of multiple fields
+
+    A `CombinedField` is created automatically when two fields are added together.
+
+    This class does not check for overlap between the fields. If there is overlap
+    between two fields, then you will simulate twice as many objects as desired at those
+    locations.
 
     Parameters
     *fields : `~sncosmo.Field` objects
