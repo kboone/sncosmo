@@ -654,7 +654,7 @@ class VolumetricSourceDistribution(SourceDistribution):
         that takes the redshift as a parameter and returns the volumetric rate
         at that redshift.
     """
-    def __init__(self, volumetric_rate=None, min_redshift=0., max_redshift=3.,
+    def __init__(self, volumetric_rate=None, min_redshift=0., max_redshift=2.,
                  cosmo=default_cosmo):
         if volumetric_rate is not None:
             self.volumetric_rate = volumetric_rate
@@ -823,7 +823,7 @@ class SALT2Distribution(VolumetricSourceDistribution):
     sigma_int = 0.1
 
     def volumetric_rate(self, redshift):
-        return 2.6e-5 * (1 + redshift)
+        return sn1a_volumetric_rate(redshift)
 
     def simulate_parameters(self, locations):
         model = Model(source='salt2-extended')
@@ -907,6 +907,7 @@ def _generate_parameter_dicts(**kwargs):
 
 
 def cc_volumetric_rate(z):
+    z_raw = z
     z = np.atleast_1d(z)
 
     result = np.zeros(shape=np.shape(z))
@@ -916,7 +917,24 @@ def cc_volumetric_rate(z):
     result[low_z_mask] = (5.0e-5*(1+z[low_z_mask])**4.5)
     result[~low_z_mask] = 5.44e-4
 
-    if np.ndim(z) == 0:
+    if np.ndim(z_raw) == 0:
+        return result[0]
+    else:
+        return result
+
+
+def sn1a_volumetric_rate(z):
+    z_raw = z
+    z = np.atleast_1d(z)
+
+    result = np.zeros(shape=np.shape(z))
+
+    low_z_mask = z < 1.
+
+    result[low_z_mask] = 1.8e-5 * (1 + z[low_z_mask])**2.15
+    result[~low_z_mask] = 9.5e-5 * (1 + z[~low_z_mask])**-0.25
+
+    if np.ndim(z_raw) == 0:
         return result[0]
     else:
         return result
